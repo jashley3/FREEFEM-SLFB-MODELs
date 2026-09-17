@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov  7 19:04:02 2025
+
+@author: james-ashley
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+import os
+
+
+
+
+#Constant current
+
+'''Tfinal = 3600
+def Iapp(a1):
+    return 2 + a1*0
+
+def dIapp(a1):
+    return a1*0
+
+def d2Iapp(a1):
+    return a1*0
+#'''
+
+
+
+
+
+
+#Step-function Iapp(t)
+
+'''Iapp0=2
+tch1=3600
+topen1=60
+tdisch1=3570
+topen2=60
+tchar2=3600
+Kiapp=5
+Diapp=0
+
+
+Tfinal = tch1+topen1+tdisch1+topen2+tchar2
+def Iapp(a1):
+    return (Iapp0*(0.5 + 0.5*np.tanh(Kiapp*((a1) + Diapp))) - Iapp0*(0.5 + 0.5*np.tanh(Kiapp*((a1) - tch1)))-Iapp0*(0.5 + 0.5*np.tanh(Kiapp*((a1) - (tch1+topen1))))+Iapp0*(0.5 + 0.5*np.tanh(Kiapp*((a1) - (tch1+topen1+tdisch1)))) + Iapp0*(0.5 + 0.5*np.tanh(Kiapp*((a1) - (tch1+topen1+tdisch1+topen2)))))
+
+def dIapp(a1):
+    return (Iapp0*0.5*(np.cosh(Kiapp*((a1) + Diapp)))**(-2)*Kiapp - Iapp0*0.5*(np.cosh(Kiapp*((a1) - tch1)))**(-2)*Kiapp - Iapp0*0.5*(np.cosh(Kiapp*((a1) - (tch1+topen1))))**(-2)*Kiapp + Iapp0*0.5*(np.cosh(Kiapp*((a1) - (tch1+topen1+tdisch1))))**(-2)*Kiapp + Iapp0*0.5*(np.cosh(Kiapp*((a1) - (tch1+topen1+tdisch1+topen2))))**(-2)*Kiapp)
+
+def d2Iapp(a1):
+    return (-Iapp0*(Kiapp**2)*np.tanh(Kiapp*((a1) + Diapp))*(np.cosh(Kiapp*((a1) + Diapp)))**(-2) + Iapp0*(Kiapp**2)*np.tanh(Kiapp*((a1) - tch1))*(np.cosh(Kiapp*((a1) - tch1)))**(-2) + Iapp0*(Kiapp**2)*np.tanh(Kiapp*((a1) - (tch1+topen1)))*(np.cosh(Kiapp*((a1) - (tch1+topen1))))**(-2) -Iapp0*(Kiapp**2)*np.tanh(Kiapp*((a1) - (tch1+topen1+tdisch1)))*(np.cosh(Kiapp*((a1) - (tch1+topen1+tdisch1))))**(-2) - Iapp0*(Kiapp**2)*np.tanh(Kiapp*((a1) - (tch1+topen1+tdisch1+topen2)))*(np.cosh(Kiapp*((a1) - (tch1+topen1+tdisch1+topen2))))**(-2) )
+#'''
+
+
+
+
+
+
+#Messy Iapp(t)
+
+Tfinal=300
+def Iapp(a1):
+    return 2 + 0.6*np.sin(2*np.pi*a1/300) + 0.3*np.sin(2*np.pi*a1/75 + 1) + 0.1*np.sin(2*np.pi*a1/20 + 2)
+
+def dIapp(a1):
+    return (0.6*(2*np.pi/300)*np.cos(2*np.pi*a1/300) + 0.3*(2*np.pi/75)*np.cos(2*np.pi*a1/75 + 1) + 0.1*(2*np.pi/20)*np.cos(2*np.pi*a1/20 + 2))
+
+def d2Iapp(a1):
+    return (-0.6*(2*np.pi/300)**2*np.sin(2*np.pi*a1/300)-0.3*(2*np.pi/75)**2*np.sin(2*np.pi*a1/75 + 1)-0.1*(2*np.pi/20)**2*np.sin(2*np.pi*a1/20 + 2))
+#'''
+
+
+
+
+
+
+#Curvature
+def k(a1):
+    return abs(d2Iapp(a1))/((1+(dIapp(a1))**2)**1.5)
+
+
+
+
+grid=1500000
+t_dense = np.linspace(0, Tfinal, grid)
+kdisc=k(t_dense)
+
+
+
+
+peaks, _ = find_peaks(kdisc)
+idx = np.concatenate([peaks])
+idx = idx[(idx >= 0) & (idx < len(t_dense ))]
+idx_unique = np.unique(idx)
+t_final = t_dense [idx_unique]
+zero_array=np.array([0])
+t_final=np.concatenate((zero_array,t_final))
+print(t_final)
+
+
+
+t_dense = np.linspace(0, Tfinal, 150000)
+plt.figure(figsize=(8,4))
+plt.plot(t_dense, Iapp(t_dense), 'k', lw=1.5, label="Iapp(t)")
+plt.scatter(t_final, Iapp(t_final), color='red', s=20, label='Breakpoints')
+plt.xlabel("Time t")
+plt.ylabel("Iapp(t)")
+plt.legend()
+plt.title("Adaptive Breakpoint Detection (robust)")
+plt.tight_layout()
+plt.show()#'''
+
+
+ 
+    
+ 
+ 
+# Save to text file (NOTE: ensure this saves to the correct directory before running the FreeFem code; ideally, make sure the FreeFem code and this Python file are in the same directory)
+
+np.savetxt("BreakpointsForFreeFemCode.txt", t_final, fmt="%.10f")
+print("Saving breakpoints file to:", os.getcwd())
+
+
+N = len(t_final)
+
+# Save length on first line, values on second line
+with open("BreakpointsForFreeFemCode.txt", "w") as f:
+    f.write(f"{N}\n")
+    np.savetxt(f, t_final[None, :], fmt="%.10f")
+
+

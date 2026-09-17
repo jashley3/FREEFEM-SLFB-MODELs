@@ -1,0 +1,159 @@
+
+
+
+//Model parameters                         
+real V = 0.025; //average speed of flow
+real D = 0.1; //length of cell along z axis   
+real Vr = 0.0015; // reservoir volume 
+real F = 96485.0; //Faraday's constant
+real T = 298; //Temperature
+real R = 8.3144621; //molar gas constant
+
+
+//Ion charges (DO NOT CHANGE)
+real z1=2; // Pb2+
+real z2=1; // H+
+real z3=-1; // CH3SO3-
+
+
+
+// Electrode Kinetics
+real k0pb = 5.05e-5*(T/298.)*exp(-(13080/8.31)*((1/T)-(1/298.))); // Rate constant for negative electrode reaction                              
+real k0BETApb02=5e-6*(T/298.)*exp(-(20900/8.31)*((1/T)-(1/298.))); // Rate constant for positive electrode main reaction                  
+real k0pboBETA=5e-5*(T/298.)*exp(-(20900/8.31)*((1/T)-(1/298.))); // Rate constant for positive electrode side reaction                          
+
+real alphaCpb=1; //Transfer coefficient for negative electrode reaction
+real alphaCBETApbo2=1; //Transfer coefficient for positive electrode main reaction
+real alphaCpboBETA=0.8; //Transfer coefficient for positive electrode side reaction
+
+real Eminus = -0.126; //Standard potential of negative electrode reaction (known experimental value versus standard hydrogen electrode)
+real Ebeta1=1.66; // Standard potential of positive electrode main reaction (empirically fitted)
+real Ebeta2=1.58; // Standard potential of positive electrode side reaction (empirically fitted)
+
+
+
+// Reference concentrations
+real u1theta=1000;// Reference concentration for Pb2+ ions
+real u2theta=1000; // Reference concentration for H+ ions
+
+
+
+
+//Mesh generation
+real L = 0.1; //Length of cell along y axis
+real W = 0.012; //Electrode separation along x axis 
+
+/*
+-----Mesh label key-----
+
+Bottom edge label = 1  ->  inlet
+
+Right edge label = 2   ->  negative electrode
+
+Top edge label = 3     ->  outlet
+
+Left edge label = 4    ->  positive electrode 
+*/
+
+int nx = 25; // Number of vertices along x
+int ny = 15; // Number of vertices along y
+real AB = 6.0; // Smoothing factor between the dense and sparse regions of the mesh
+
+func real stretchX(real s) {
+    return 0.5*(tanh(AB*(s-0.5))/tanh(AB/2.0) + 1.0);
+}
+
+// Power-law stretching in y
+real q = 1.6; //1.44
+func real stretchY(real t) {
+    return pow(t, q);
+}
+
+mesh dom4 = square(nx, ny, [ W*stretchX(x), L*stretchY(y) ]);
+plot(dom4, wait=1);
+
+
+
+//Timestepping
+real dtmax=100; // Maximum timestep the solver can use
+real dtmin=5e-5; // Minimum allowed timestep: should be chosen to resolve the expected maximum degree of variation of the solution with time. E.g., if Iapp has a high frequency, make sure dtmin is small enough to resolve this.
+real stepsizeratio=2; // The factor used to adjust the time step-size. 2 is found to work well. Sharper changes in dt make it more likely for the solution to diverge or/and become unstable.
+
+
+//Initialisation
+real u1initial=1000; // Initial Pb2+ concentration
+real u2initial=500; // Initial H+ concentration
+real Cpbinitial=0; // Initial Pb concentration on negative electrode
+real Cpbo2initial=0; // Initial PbO2 concentration on positive electrode
+real Cpboinitial=0; // Initial PbO concentration on positive electrode
+
+
+//Guesses for Newton loop
+real VOLTguess=1.9; // Initial guess for cell voltage
+real phiguess=-0.7; // Initial guess for solution potential
+
+
+//Solver tolerances
+int MC=10; // The number of timesteps that must complete following a timestep decrease before the timestep is allowed to increase again; 10 is quite strict.
+int newtTOL=30; // Maximum number of Newton iterations allowed in a single Newton loop.
+real errTOL=1e-6; // The required error tolerance that must be satisified for the Newton loop to complete.
+real curTOL=1e-6; // The required absolute precision to which the applied current is solved.
+
+
+
+int BDF3=1; //Set to zero and only BDF1+2 will be used. Recommended to avoid BDF3 if instabilities are observed in the solution. May arise as oscillations which grow with time, particularly if dt is set to be overly small.
+
+
+
+
+
+//Macros for the applied current and its derivative WRT time; the input is time, a1 = t. Some options are included, user can put new functions in too.
+
+
+//  1) Constant current (no breakpoints needed)
+macro Iapp(a1) 2.0 //
+real ttotal=3600; // Total desired simulated time (in seconds); the simulation ends when t reaches ttotal. User must specify this.
+//*/
+
+
+
+
+
+//   2) Step function for constant-current charge-discharge cycling
+/*real Iapp0=2; //absolute value of applied current during charge and disch
+real tch1=3600; //3600 //length of first charge
+real topen1=60; //length of open circuit 1
+real tdisch1=3550;//3440; //3580 //length of first discharge 3550
+real topen2=60; //lenght of open circuit 2
+real tchar2=3600; //3600 //length of second charge
+
+real ttotal=tch1+topen1+tdisch1+topen2+tchar2; //total time of operation; simulation ends when t>ttotal. User must specify this.
+
+real[int] tintervallengths=[0,tch1,topen1,tdisch1,topen2,tchar2]; 
+
+real Kiapp=5;//5.6234;//1e4;//1e12;
+real Diapp=0;//0//1e-10;
+macro Iapp(a1) (Iapp0*(0.5 + 0.5*tanh(Kiapp*((a1) + Diapp))) - Iapp0*(0.5 + 0.5*tanh(Kiapp*((a1) - tch1)))-Iapp0*(0.5 + 0.5*tanh(Kiapp*((a1) - (tch1+topen1))))+Iapp0*(0.5 + 0.5*tanh(Kiapp*((a1) - (tch1+topen1+tdisch1)))) + Iapp0*(0.5 + 0.5*tanh(Kiapp*((a1) - (tch1+topen1+tdisch1+topen2))))) //
+//*/
+
+
+
+
+
+//   3) A messy applied current function so test solver.
+/*macro Iapp(a1) (2 + 0.6*sin(2*pi*a1/300) + 0.3*sin(2*pi*a1/75 + 1) + 0.1*sin(2*pi*a1/20 + 2)) //
+real ttotal=110;//*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+

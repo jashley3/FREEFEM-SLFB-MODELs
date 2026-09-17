@@ -1,0 +1,1995 @@
+load "Element_P3"
+load "Element_P4"
+load "msh3"
+load "MUMPS_seq"
+load "iovtk"
+
+cout.precision(10); 
+
+
+
+ifstream in("BreakpointsForFreeFemCode.txt"); //Generated using BreakPointsPython6
+int Nbreak;
+in >> Nbreak;                       // read first line: number of points
+real[int] tfinal(Nbreak);           // preallocate
+for (int i = 0; i < Nbreak; ++i)
+    in >> tfinal[i];           // read values
+
+cout << "Imported " << tfinal.n << " points:\n";
+cout << tfinal << endl;
+
+int ibreak=0;
+
+
+
+real dt; //Current timestep
+real DT;
+real dtold; //Previous timestep value A
+real dtold2; //Previous timestep value B
+real dtold3;
+real om;
+
+
+//Integers used to indicate which BDF order is being used
+int check=0;
+int dHeat3check=0;
+
+
+
+
+//File containing the model parameters, error tolerances and mesh.
+include "ParametersAndMesh.edp";
+
+//Self-diffusion coefficients
+real mu1 = 9.2473e-10*(1+0.0233496*(T-298)+0.000146144*(T-298)^2); // Diffusion coefficient for Pb2+
+real mu2 = 9.3297e-9*(1+0.0165032*(T-298)); // Diffusion coefficient for H+
+real mu3 = 1.4441e-9*(1+0.0229309*(T-298)+0.000173225*(T-298)^2);//2e-10; // Diffusion coefficient fo CH3SO3-
+
+real k=1e21; //Parameter 1 for the continuous Heaviside functions
+real DELTA=1e-18; //Parameter 2 for the continuous Heaviside functions
+
+
+
+
+real VOLT; //Voltage across the cell (this is the voltage in the solid phase of the positive electrode, but we set the analgous value in the negative electrode to zero. So, VOLT=VOLTplus - VOLTminus=Voltplus.). This quantity is spatially invariant in our model, so it is only a real number, not a FE function.
+real dVOLT;
+real VOLTprev;
+real VOLTprev2;
+real err1=1; //The error associated with the Newton iterations (not used in solver, but useful quantity to track). Need to initialise it so the while loop doesn't immediately cancel.
+
+
+
+
+int[int] ll=[1];
+meshL TBh = extract(dom4,label=ll);
+fespace VBh(TBh,P1);
+
+
+int[int] llout=[3];
+meshL TBhout = extract(dom4,label=llout);
+fespace VBhout(TBhout,P1);
+
+//Negative electrode
+int[int] ll3=[2]; 
+meshL dom4wall2 = extract(dom4,label=ll3); // extract only border with label wall2  Alternatively, define on dom4fixed
+fespace Vh4bound(dom4wall2,P1);
+
+
+//Positive electrode
+int[int] ll4=[4]; 
+meshL dom4wall1 = extract(dom4,label=ll4); // extract only border with label wall2  Aleternatively, define on dom4fixed
+fespace Vh4ver2bound(dom4wall1,P1);
+
+
+
+
+fespace Vh(dom4, P1); 
+
+Vh du1, v1, u1;
+
+real uin1;
+
+
+
+
+fespace Vh2(dom4, P1);
+
+Vh2 du2, v2, u2;
+
+real uin2;
+
+
+
+
+fespace Vh3(dom4, P1);
+
+Vh3 dphi, v3, phi;  
+
+
+
+
+
+Vh4ver2bound  CbpbO2, dCbpbO2, CpbO, dCpbO, dCbpbO2Lin, dCpbOLin, GAM1, H1, SIG1,  Rpbo2, Rpbo;
+
+Vh4bound Cpb, dCpb, dCpbLin, Rpb;
+
+real Rc1in, Rc2in;
+
+
+fespace Vh5(dom4, P2);
+
+Vh5 jpbFE, jpbdu1FE, jpbdphiFE, jpbO2FE, jpbO2du1FE, jpbO2du2FE, jpbO2dphiFE, jpbOFE, jpbOdu2FE, jpbOdphiFE;
+
+
+
+
+
+
+
+int Nstore=5; //The number of most recent solutions the solver will store
+
+Vh U1[Nstore];
+
+Vh2 U2[Nstore];
+
+Vh3 PHI[Nstore];
+
+Vh4ver2bound CPBO2[Nstore], CPBO[Nstore];
+
+Vh4bound CPB[Nstore];
+
+real[int] UIN1(Nstore);
+real[int] UIN2(Nstore);
+
+
+
+
+//Define arrays for the quantities of interest
+real[int] timevals; 
+real[int] voltvals;
+real[int] CpbAvVals;
+real[int] CbpbO2AvVals;
+real[int] CpbOAvVals;
+real[int] itotvals; 
+real[int] errvals; 
+real[int] uin1AvVals;
+real[int] uin2AvVals;
+real[int] dvoltErrvals;
+real[int] outintvals1;
+real[int] outintvals2;
+real[int] c1normvals;
+real[int] c2normvals;
+real[int] phinormvals;
+real[int] kappavalsA;
+real[int] D10valsA;
+real[int] D20valsA;
+real[int] D30valsA;
+real[int] t1vals;
+real[int] t2vals;
+real[int] t3vals;
+
+
+
+
+
+
+//Macros for the Butler-Volmer expressions and their derivatives:
+//WHERE phiminus=-VOLT/2 and phiplus=VOLT/2
+
+//a1=y   Place this in front of all macros for the Butler-VOlmers and their derivatives if smoothing is wanted near the inlet and outlet (transition to zero across a distance of 1mm)
+macro smoother(a1) ((0.5+0.5*tanh(1e4*(a1-0.0005)))-(0.5+0.5*tanh(1e4*(a1-0.0995)))) //
+
+
+
+//a1=u1, a2=phi, a3=Cpb jpb(u1,phi,Cpb)
+macro jpb(a1,a2,a3) (2*F*k0pb*((0.5+0.5*tanh(k*(a3-DELTA)))*exp((((2-alphaCpb)*F)/(R*T))*(-(VOLT/2)-a2-Eminus))-(a1/u1theta)*exp(-((alphaCpb*F)/(R*T))*(-(VOLT/2)-a2-Eminus)))) //
+
+
+//a1=phi
+macro jpbdu1(a1) (-2*F*k0pb*(1/u1theta)*exp(-((alphaCpb*F)/(R*T))*(-(VOLT/2)-a1-Eminus))) //
+
+
+//a1=u1, a2=phi, a3=Cpb jpb(u1,phi,Cpb)
+macro jpbdphi(a1,a2,a3) (-2*F*k0pb*((0.5+0.5*tanh(k*(a3-DELTA)))*(((2-alphaCpb)*F)/(R*T))*exp((((2-alphaCpb)*F)/(R*T))*(-(VOLT/2)-a2-Eminus)) + (a1/u1theta)*((alphaCpb*F)/(R*T))*exp(-((alphaCpb*F)/(R*T))*(-(VOLT/2)-a2-Eminus)))) //
+
+
+
+
+//a1=u1, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO, a6=u2   ---   jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2)
+macro jpbO2(a1,a2,a3,Spbo2,Spbo,a6) (2*F*k0BETApb02*((a1/u1theta)*exp((((2-alphaCBETApbo2)*F)/(R*T))*(a3/2-a2-Ebeta1))-(Spbo2/(Spbo2+Spbo+1e-90))*((a6/u2theta)^4)*exp(-((alphaCBETApbo2*F)/(R*T))*(a3/2-a2-Ebeta1)))) //
+
+
+//a1=phi, a2=VOLT
+macro jpbO2du1(a1,a2) (2*F*k0BETApb02*(1/u1theta)*exp((((2-alphaCBETApbo2)*F)/(R*T))*(a2/2-a1-Ebeta1))) //
+
+
+//a1=u2, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO    ----    jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)
+macro jpbO2du2(a1,a2,a3,Spbo2,Spbo) (-2*F*k0BETApb02*(Spbo2/(Spbo2+Spbo+1e-90))*((4*a1^3)/(u2theta^4))*exp(-((alphaCBETApbo2*F)/(R*T))*(a3/2-a2-Ebeta1))) //
+
+
+//a1=u1, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO, a5=u2    ----    jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)
+macro jpbO2dphi(a1,a2,a3,Spbo2,Spbo,a5) (-2*F*k0BETApb02*((a1/u1theta)*(((2-alphaCBETApbo2)*F)/(R*T))*exp((((2-alphaCBETApbo2)*F)/(R*T))*(a3/2-a2-Ebeta1)) + (Spbo2/(Spbo2+Spbo+1e-90))*((a5/u2theta)^4)*((alphaCBETApbo2*F)/(R*T))*exp(-((alphaCBETApbo2*F)/(R*T))*(a3/2-a2-Ebeta1)))) //
+
+
+
+
+//a1=u2, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO    ---   jpbO(u2,phi,VOLT,CbpbO2,CpbO) 
+macro jpbO(a1,a2,a3,Spbo2,Spbo) (2*F*k0pboBETA*((Spbo/(Spbo2+Spbo+1e-90))*exp((((2-alphaCpboBETA)*F)/(R*T))*(a3/2-a2-Ebeta2))-(Spbo2/(Spbo2+Spbo+1e-90))*((a1/u2theta)^2)*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2)))) //
+
+
+//a1=u2,a2=phi,a3=VOLT,Spbo2=CbpbO2,Spbo=CpbO    ----    jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)
+macro jpbOdu2(a1,a2,a3,Spbo2,Spbo) (-2*F*k0pboBETA*(Spbo2/(Spbo2+Spbo+1e-90))*((2*a1)/(u2theta^2))*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2))) //
+
+
+//a1=u2, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO    ----    jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)
+macro jpbOdphi(a1,a2,a3,Spbo2,Spbo) (-2*F*k0pboBETA*((Spbo/(Spbo2+Spbo+1e-90))*(((2-alphaCpboBETA)*F)/(R*T))*exp((((2-alphaCpboBETA)*F)/(R*T))*(a3/2-a2-Ebeta2)) + (Spbo2/(Spbo2+Spbo+1e-90))*((a1/u2theta)^2)*((alphaCpboBETA*F)/(R*T))*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2)))) //
+
+
+
+
+//a1=Cpb, a2=phi
+macro DjpbDcpb(a1,a2) (2*F*k0pb*(0.5*k*(cosh(k*(a1-DELTA)))^-2)*exp((((2-alphaCpb)*F)/(R*T))*(-VOLT/2-a2-Eminus))) // // Alt: DjpbDcpb=0 (because, apb=1 for all Cpb)
+
+
+//a1=CbpbO2, a2=CpbO, a3=u2, a4=VOLT, a5=phi
+macro Djpbo2Dcpbo2(a1,a2,a3,a4,a5) (-2*F*k0BETApb02*(a2/((a2+a1)^2 + 1e-90))*((a3/u2theta)^4)*exp(-((alphaCBETApbo2*F)/(R*T))*(a4/2-a5-Ebeta1)) ) //
+
+//a1=CbpbO2, a2=CpbO, a3=u2, a4=VOLT, a5=phi
+macro Djpbo2Dcpbo(a1,a2,a3,a4,a5) ( 2*F*k0BETApb02*(a1/((a2+a1)^2 + 1e-90))*((a3/u2theta)^4)*exp(-((alphaCBETApbo2*F)/(R*T))*(a4/2-a5-Ebeta1)) ) //
+
+
+//a1=u2, a2=phi, a3=VOLT, a4=CpbO, a5=CbpbO2
+macro DjpboDcpbo2(a1,a2,a3,a4,a5) (2*F*k0pboBETA*(((-a4/((a4+a5)^2+1e-90)))*exp((((2-alphaCpboBETA)*F)/(R*T))*(a3/2-a2-Ebeta2))-(a4/((a4+a5)^2 + 1e-90))*((a1/u2theta)^2)*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2)))) //
+
+
+//a1=u2, a2=phi, a3=VOLT, a4=CpbO, a5=CbpbO2
+macro DjpboDcpbo(a1,a2,a3,a4,a5) (2*F*k0pboBETA*(((a5/((a4+a5)^2+1e-90)))*exp((((2-alphaCpboBETA)*F)/(R*T))*(a3/2-a2-Ebeta2))+(a5/((a4+a5)^2 + 1e-90))*((a1/u2theta)^2)*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2)))) //
+
+
+
+
+
+//a1=u1, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO, a6=u2    ----     Djpbo2Dvolt(u1,phi,VOLT,CbpbO2,CpbO,u2)
+macro Djpbo2Dvolt(a1,a2,a3,Spbo2,Spbo,a6) (2*F*k0BETApb02*((a1/u1theta)*0.5*(((2-alphaCBETApbo2)*F)/(R*T))*exp((((2-alphaCBETApbo2)*F)/(R*T))*(a3/2-a2-Ebeta1))-(Spbo2/(Spbo2+Spbo+1e-90))*((a6/u2theta)^4)*0.5*(-(alphaCBETApbo2*F)/(R*T))*exp(-((alphaCBETApbo2*F)/(R*T))*(a3/2-a2-Ebeta1)))) //
+
+
+//a1=u2, a2=phi, a3=VOLT, Spbo2=CbpbO2, Spbo=CpbO     ----       DjpboDvolt(u2,phi,VOLT,CbpbO2,CpbO)
+macro DjpboDvolt(a1,a2,a3,Spbo2,Spbo) (2*F*k0pboBETA*((Spbo/(Spbo2+Spbo+1e-90))*0.5*(((2-alphaCpboBETA)*F)/(R*T))*exp((((2-alphaCpboBETA)*F)/(R*T))*(a3/2-a2-Ebeta2))-(Spbo2/(Spbo2+Spbo+1e-90))*((a1/u2theta)^2)*0.5*(-(alphaCpboBETA*F)/(R*T))*exp(-((alphaCpboBETA*F)/(R*T))*(a3/2-a2-Ebeta2)))) //
+//*/
+
+
+
+
+
+
+
+
+//Weak formulations
+
+problem dHeat (du1, du2, dphi, v1, v2, v3)//, solver="MUMPS") //the order matters: put your unknowns first, then your test functions
+
+    =int2d(dom4)(
+
+        du1*v1 //bilinear
+
+        + du2*v2
+
+        + dt*mu1*(dx(du1)*dx(v1) + dy(du1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*(u1*(dx(dphi)*dx(v1) + dy(dphi)*dy(v1)) + du1*(dx(phi)*dx(v1) + dy(phi)*dy(v1)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du1*dy(v1))
+
+        + dt*mu2*(dx(du2)*dx(v2) + dy(du2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*(u2*(dx(dphi)*dx(v2) + dy(dphi)*dy(v2)) + du2*(dx(phi)*dx(v2) + dy(phi)*dy(v2)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(du1)*dx(v3) + dy(du1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(du2)*dx(v3) + dy(du2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*(u1*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du1*(dx(phi)*dx(v3) + dy(phi)*dy(v3))) + (mu2+mu3)*(u2*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du2*(dx(phi)*dx(v3) + dy(phi)*dy(v3))))
+
+    )
+
+    + int2d(dom4)( //linear
+
+        u1*v1
+
+        + u2*v2
+
+        + dt*mu1*(dx(u1)*dx(v1) + dy(u1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*u1*(dx(phi)*dx(v1) + dy(phi)*dy(v1))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u1*dy(v1))
+
+        + dt*mu2*(dx(u2)*dx(v2) + dy(u2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*u2*(dx(phi)*dx(v2) + dy(phi)*dy(v2))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(u1)*dx(v3) + dy(u1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(u2)*dx(v3) + dy(u2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*u1*(dx(phi)*dx(v3) + dy(phi)*dy(v3)) + (mu2+mu3)*u2*(dx(phi)*dx(v3) + dy(phi)*dy(v3)))
+
+    //)
+
+    //+ int2d(dom4)(
+
+        -U1[Nstore-1]*v1
+
+        -U2[Nstore-1]*v2   
+
+    )
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*u1) + dt*(6*V/(W^2))*x*(W-x)*(v2*u2)) //linear
+
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)) 
+
+    + dt*v3*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(2/F)*v2*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(1/F)*v2*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    - dt*v3*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+    
+    - dt*v3*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)))
+
+
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*du1) + dt*(6*V/(W^2))*x*(W-x)*(v2*du2)) //bilinear
+    
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)) 
+    
+    + dt*v3*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*(2/F)*v2*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v2*(1/F)*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    -dt*v3*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v3*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) ) //side reaction part 2
+
+    + on(1, du1=uin1-u1)
+
+    + on(1, du2=uin2-u2)
+
+    ;
+
+
+
+
+
+problem dHeat2 (du1, du2, dphi, v1, v2, v3, solver="MUMPS_seq")//, solver="MUMPS") //the order matters: put your unknowns first, then your test functions
+
+    =int2d(dom4)(
+
+        ((2*(dt/dtold)+1)/((dt/dtold)+1))*du1*v1 //bilinear
+
+        + ((2*(dt/dtold)+1)/((dt/dtold)+1))*du2*v2
+
+        + dt*mu1*(dx(du1)*dx(v1) + dy(du1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*(u1*(dx(dphi)*dx(v1) + dy(dphi)*dy(v1)) + du1*(dx(phi)*dx(v1) + dy(phi)*dy(v1)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du1*dy(v1))
+
+        + dt*mu2*(dx(du2)*dx(v2) + dy(du2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*(u2*(dx(dphi)*dx(v2) + dy(dphi)*dy(v2)) + du2*(dx(phi)*dx(v2) + dy(phi)*dy(v2)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(du1)*dx(v3) + dy(du1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(du2)*dx(v3) + dy(du2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*(u1*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du1*(dx(phi)*dx(v3) + dy(phi)*dy(v3))) + (mu2+mu3)*(u2*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du2*(dx(phi)*dx(v3) + dy(phi)*dy(v3))))
+
+    )
+
+    + int2d(dom4)( //linear
+
+        ((2*(dt/dtold)+1)/((dt/dtold)+1))*u1*v1
+
+        + ((2*(dt/dtold)+1)/((dt/dtold)+1))*u2*v2
+
+        + dt*mu1*(dx(u1)*dx(v1) + dy(u1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*u1*(dx(phi)*dx(v1) + dy(phi)*dy(v1))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u1*dy(v1))
+
+        + dt*mu2*(dx(u2)*dx(v2) + dy(u2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*u2*(dx(phi)*dx(v2) + dy(phi)*dy(v2))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(u1)*dx(v3) + dy(u1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(u2)*dx(v3) + dy(u2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*u1*(dx(phi)*dx(v3) + dy(phi)*dy(v3)) + (mu2+mu3)*u2*(dx(phi)*dx(v3) + dy(phi)*dy(v3)))
+
+    //)
+
+    //+ int2d(dom4)(
+
+        -((dt/dtold)+1)*U1[Nstore-1]*v1 + (((dt/dtold)^2)/((dt/dtold)+1))*U1[Nstore-2]*v1
+
+        -((dt/dtold)+1)*U2[Nstore-1]*v2 + (((dt/dtold)^2)/((dt/dtold)+1))*U2[Nstore-2]*v2   
+
+    )
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*u1) + dt*(6*V/(W^2))*x*(W-x)*(v2*u2)) //linear
+
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)) 
+
+    + dt*v3*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(2/F)*v2*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(1/F)*v2*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    - dt*v3*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+    
+    - dt*v3*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)))
+
+
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*du1) + dt*(6*V/(W^2))*x*(W-x)*(v2*du2)) //bilinear
+    
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)) 
+    
+    + dt*v3*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*(2/F)*v2*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v2*(1/F)*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    -dt*v3*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v3*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) ) //side reaction part 2
+
+
+    + on(1, du1=uin1-u1)
+
+    + on(1, du2=uin2-u2)
+
+    ;
+
+
+
+problem dHeat3 (du1, du2, dphi, v1, v2, v3, solver="MUMPS_seq")//, solver="MUMPS") //the order matters: put your unknowns first, then your test functions
+
+    =int2d(dom4)(
+
+        (((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*du1*v1 //bilinear
+
+        + (((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*du2*v2
+
+        + dt*mu1*(dx(du1)*dx(v1) + dy(du1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*(u1*(dx(dphi)*dx(v1) + dy(dphi)*dy(v1)) + du1*(dx(phi)*dx(v1) + dy(phi)*dy(v1)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du1*dy(v1))
+
+        + dt*mu2*(dx(du2)*dx(v2) + dy(du2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*(u2*(dx(dphi)*dx(v2) + dy(dphi)*dy(v2)) + du2*(dx(phi)*dx(v2) + dy(phi)*dy(v2)))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(du2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(du1)*dx(v3) + dy(du1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(du2)*dx(v3) + dy(du2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*(u1*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du1*(dx(phi)*dx(v3) + dy(phi)*dy(v3))) + (mu2+mu3)*(u2*(dx(dphi)*dx(v3) + dy(dphi)*dy(v3)) + du2*(dx(phi)*dx(v3) + dy(phi)*dy(v3))))
+
+    )
+
+    + int2d(dom4)( //linear
+
+        (((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*u1*v1
+
+        + (((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*u2*v2
+
+        + dt*mu1*(dx(u1)*dx(v1) + dy(u1)*dy(v1))
+
+        + 2*dt*mu1*(F/(R*T))*u1*(dx(phi)*dx(v1) + dy(phi)*dy(v1))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u1*dy(v1))
+
+        + dt*mu2*(dx(u2)*dx(v2) + dy(u2)*dy(v2))
+
+        + dt*mu2*(F/(R*T))*u2*(dx(phi)*dx(v2) + dy(phi)*dy(v2))
+
+        - dt*(6*V/(W^2))*x*(W-x)*(u2*dy(v2))
+
+        + dt*F*(2*mu1-2*mu3)*(dx(u1)*dx(v3) + dy(u1)*dy(v3))
+
+        + dt*F*(mu2-mu3)*(dx(u2)*dx(v3) + dy(u2)*dy(v3))
+
+        + dt*(F^2/(R*T))*((4*mu1+2*mu3)*u1*(dx(phi)*dx(v3) + dy(phi)*dy(v3)) + (mu2+mu3)*u2*(dx(phi)*dx(v3) + dy(phi)*dy(v3)))
+
+    //)
+
+    //+ int2d(dom4)(
+
+        -(((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*U1[Nstore-1]*v1 - (((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+dt/dtold))/((1+(dtold/dtold2)+((dt/dtold)*(dtold/dtold2)))*(1+dtold/dtold2))))*(dt/dtold)*(U1[Nstore-1]-U1[Nstore-2])*v1 +(((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2))))*(dt/dtold2)*(U1[Nstore-2]-U1[Nstore-3])*v1
+
+        -(((2*(dt/dtold)+1)/((dt/dtold)+1)) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))))*U2[Nstore-1]*v2 - (((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+dt/dtold))/((1+(dtold/dtold2)+((dt/dtold)*(dtold/dtold2)))*(1+dtold/dtold2))))*(dt/dtold)*(U2[Nstore-1]-U2[Nstore-2])*v2 +(((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1+(dtold/dtold2)+(dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2))))*(dt/dtold2)*(U2[Nstore-2]-U2[Nstore-3])*v2   
+
+    )
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*u1) + dt*(6*V/(W^2))*x*(W-x)*(v2*u2)) //linear
+
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)) 
+
+    + dt*v3*(jpb(u1,phi,Cpb) + dCpbLin*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(2/F)*v2*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi)) 
+
+    - dt*(1/F)*v2*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    - dt*v3*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + dCbpbO2Lin*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + dCpbOLin*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+    
+    - dt*v3*(jpbO(u2,phi,VOLT,CbpbO2,CpbO) + dCbpbO2Lin*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + dCpbOLin*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)))
+
+
+
+    + int1d(dom4, 3)(dt*(6*V/(W^2))*x*(W-x)*(v1*du1) + dt*(6*V/(W^2))*x*(W-x)*(v2*du2)) //bilinear
+    
+
+    - int1d(dom4, 2)(dt*(1/(2*F))*v1*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)) 
+    
+    + dt*v3*(du1*(jpbdu1(phi)) + dphi*(jpbdphi(u1,phi,Cpb)) + (-(1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*((om^-1)/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)))*DjpbDcpb(Cpb,phi)))
+
+
+    + int1d(dom4, 4)(dt*(1/(2*F))*v1*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*(2/F)*v2*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v2*(1/F)*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) 
+
+    -dt*v3*(du1*(jpbO2du1(phi,VOLT)) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi))
+
+    -dt*v3*(du2*(jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) + ((1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) + (-GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*((om^-1)/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2)) ) //side reaction part 2
+
+
+    + on(1, du1=uin1-u1)
+
+    + on(1, du2=uin2-u2)
+
+    ;
+
+
+//*/
+
+
+
+
+//Initial conditions: concentrations of all species are uniform in space
+
+real t=0; //Initialise time
+
+
+
+u1=u1initial;  //Initial value for Newt. iteration (initial guess. In this case, we simply take it to be the value of the solution at t=0.)
+uin1=u1[].max;
+U1[Nstore-1]=u1;
+U1[Nstore-2]=u1;
+U1[Nstore-3]=u1;
+UIN1[Nstore-1]=u1;
+UIN1[Nstore-2]=u1;
+UIN1[Nstore-3]=u1;
+
+
+u2=u2initial;
+uin2=u2[].max;
+U2[Nstore-1]=u2;
+U2[Nstore-2]=u2;
+U2[Nstore-3]=u2;
+UIN2[Nstore-1]=u2;
+UIN2[Nstore-2]=u2;
+UIN2[Nstore-3]=u2;
+
+
+phi=phiguess; //starting guess for phi in Newt iteration/initial value for phi   
+PHI[Nstore-1]=phi;
+PHI[Nstore-2]=phi;
+PHI[Nstore-3]=phi;
+
+
+//Start with bare electrodes
+Cpb=Cpbinitial;
+CPB[Nstore-1]=Cpb;
+CPB[Nstore-2]=Cpb;
+CPB[Nstore-3]=Cpb;
+dCpb=0;
+
+
+CbpbO2=Cpbo2initial;
+CPBO2[Nstore-1]=CbpbO2; 
+CPBO2[Nstore-2]=CbpbO2; 
+CPBO2[Nstore-3]=CbpbO2; 
+dCbpbO2=0;
+
+
+CpbO=Cpboinitial;
+CPBO[Nstore-1]=CpbO; 
+CPBO[Nstore-2]=CpbO; 
+CPBO[Nstore-3]=CpbO; 
+dCpbO=0;
+
+
+
+
+
+
+//Integers used when a step fails
+int K2=0;
+int Krestart=0;
+int KcancelSim=0;
+
+
+
+
+
+
+
+
+
+VOLT=VOLTguess; //Initial guess of voltage
+
+real Ineg = D*int1d(dom4, 2)(jpb(u1,phi,Cpb)); //Current at the negative electrode
+real InegPrev;
+
+real I = D*int1d(dom4, 4)(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2)+jpbO(u2,phi,VOLT,CbpbO2,CpbO)); //Current at the positive electrode
+real Iprev;
+
+
+
+
+int mrestart;
+
+int itot;
+
+
+
+dt=dtmin; dtold=dtmin; dtold2=dtmin; dtold3=dtmin;
+DT=dt;
+
+
+
+t=t-dt; 
+
+
+
+
+
+real[int] mvals; 
+int m=-1;  
+
+mvals.resize(m+2);
+mvals[m+1]=m;
+
+timevals.resize(m+2);
+timevals[m+1] = t;
+
+voltvals.resize(m+2);
+voltvals[m+1]=VOLT;
+
+dvoltErrvals.resize(m+2);
+dvoltErrvals[m+1]=0;
+
+CpbAvVals.resize(m+2);
+CpbAvVals[m+1]=0;
+
+CbpbO2AvVals.resize(m+2);
+CbpbO2AvVals[m+1]=0;
+
+CpbOAvVals.resize(m+2);
+CpbOAvVals[m+1]=1;
+
+itotvals.resize(m+2);
+itotvals[m+1] = 0;
+
+errvals.resize(m+2);
+errvals[m+1] = 0;
+
+uin1AvVals.resize(m+2);
+uin1AvVals[m+1]=1500;
+
+uin2AvVals.resize(m+2);
+uin2AvVals[m+1]=1000;
+
+outintvals1.resize(m+2);
+outintvals1[m+1]=int1d(dom4,3)((6*V/(W^2))*x*(W-x)*u1);
+
+outintvals2.resize(m+2);
+outintvals2[m+1]=int1d(dom4,3)((6*V/(W^2))*x*(W-x)*u2);
+
+c1normvals.resize(m+2);
+c1normvals[m+1]=int2d(dom4)(u1)/(W*L);//u1[].l2;
+
+c2normvals.resize(m+2);
+c2normvals[m+1]=int2d(dom4)(u2)/(W*L);//u2[].l2;
+
+phinormvals.resize(m+2);
+phinormvals[m+1]=int2d(dom4)(phi)/(W*L);//phi[].l2;
+
+
+
+
+kappavalsA.resize(m+2);
+kappavalsA[m+1]=(1/(L*W))*int2d(dom4)( (F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)) );
+
+D10valsA.resize(m+2);
+D10valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*u1/mu1); 
+
+D20valsA.resize(m+2);
+D20valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*u2/mu2); 
+
+D30valsA.resize(m+2);
+D30valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*(2*u1+u2)/mu3); 
+
+t1vals.resize(m+2);
+t1vals[m+1]=(1/(L*W))*int2d(dom4)( (z1^2*u1*F^2*mu1)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+t2vals.resize(m+2);
+t2vals[m+1]=(1/(L*W))*int2d(dom4)( (z2^2*u2*F^2*mu2)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+t3vals.resize(m+2);
+t3vals[m+1]=(1/(L*W))*int2d(dom4)( (z3^2*(2*u1+u2)*F^2*mu3)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+
+
+
+
+real dvoltErr;
+
+int mcount=0;
+
+int mRestart=0;
+
+int iBP=0;
+
+int restartNum=0;
+
+
+
+
+
+
+ofstream VOLTfile("voltvals1.txt"); //.txt
+ofstream Timefile("timevals1.txt");
+ofstream C1normfile("c1norm.txt"); //.txt
+ofstream C2normfile("c2norm.txt"); //.txt
+ofstream phinormfile("phinorm.txt"); //.txt
+ofstream outint1file("outint1.txt"); //.txt
+ofstream dvoltErrfile("dvoltErr.txt"); //.txt
+ofstream itotvalsfile("itotvals1.txt");
+ofstream err1file("err1.txt");
+ofstream Cpbfile("CpbAvVals.txt"); //.txt
+ofstream Cpbo2file("CbpbO2AvVals.txt");
+ofstream Cpbofile("CpbOAvVals.txt");
+ofstream uin1file("uin1AvVals.txt");
+ofstream uin2file("uin2AvVals.txt");
+ofstream kappafile("kappaA.txt");
+ofstream D10file("D10A.txt");
+ofstream D20file("D20A.txt");
+ofstream D30file("D30A.txt");
+ofstream t1file("t1.txt");
+ofstream t2file("t2.txt");
+ofstream t3file("t3.txt");
+
+
+
+while (t<ttotal){ //Time loop
+
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<" "<<endl;
+    cout<<"------------"<<endl;
+    cout<<"---timestep begins---"<<endl;
+    cout<<"------------"<<endl;
+    cout<<"Iapp="<<Iapp(t)<<endl;
+    cout<<"dt="<<dt<<endl;
+    cout<<"restarts="<<restartNum<<endl;
+
+    m=m+1;
+    mvals.resize(m+2);
+    mvals[m+1]= m;
+
+    
+
+    if(m>0){
+        dtold=timevals[timevals.n-1]-timevals[timevals.n-2];
+    }
+    if(m>1){
+        dtold2=timevals[timevals.n-2]-timevals[timevals.n-3];
+    }
+    if(m>2){
+        dtold3=timevals[timevals.n-3]-timevals[timevals.n-4];
+    }
+
+
+
+
+  
+
+    if(dt>dtmin && t<tfinal[tfinal.n-1]){ //If time is past the final breakpoint, don't need to enter this. 
+        for(int ii=iBP; ii<tfinal.n; ii++){
+            if(t<tfinal[ii]){
+                ibreak=ii;
+                iBP=ii-1;
+                break;
+            }
+        }
+
+        if(t + 2*dt>tfinal[ibreak]){
+            while(t+2*dt>tfinal[ibreak]){
+                if((abs(Iapp(t+dt)-Iapp(t))/abs(Iapp(t)+1e-10))<=0.01 && (t + dt<=tfinal[ibreak])){ //If the applied current changes by 1% or less relative to its current value, go with that value.
+                    break;                                              //Will prevent dt from shrinking all the way to dtmin unnecessarily.
+                }
+                dt=0.5*dt;
+                if(dt<dtmin){
+                    dt=dtmin;
+                    break;
+                }
+
+               
+            }
+        }
+    }
+
+    t=t+dt;
+
+
+    cout<<"Cell voltage="<<VOLT<<endl;
+    cout<<"m="<<m<<endl;
+    cout<<"t="<<t<<endl;
+    cout<<"---"<<endl;
+
+    K2=0; //For dealing with errors, reset to zero at start of time step
+    DT=dt;
+    int i=-1;
+    err1=1; //Reset the error to an arbitrary value larger than the tolerance so the Newton loop isn't immediately cancelled.
+  
+    du1=0;
+    du2=0;
+    dphi=0;
+
+   
+
+    //PREDICTOR
+
+    //Interpolate latest solutions and then extrapolate to obtain closer intial guess (predictor)
+    if(m>2){
+     uin1 = UIN1[Nstore-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + UIN1[Nstore-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + UIN1[Nstore-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+    }
+
+    if(m>2){
+     uin2 = UIN2[Nstore-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + UIN2[Nstore-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + UIN2[Nstore-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+    }
+    
+    if(m>2){
+     CpbO = CPBO[Nstore-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + CPBO[Nstore-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + CPBO[Nstore-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+     CpbO=(0.5+0.5*tanh(k*(CpbO-DELTA)))*CpbO;
+    }
+
+    if(m>2){
+     CbpbO2 = CPBO2[Nstore-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + CPBO2[Nstore-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + CPBO2[Nstore-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+     CbpbO2=(0.5+0.5*tanh(k*(CbpbO2-DELTA)))*CbpbO2;
+    }
+
+    if(m>2){
+     Cpb = CPB[Nstore-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + CPB[Nstore-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + CPB[Nstore-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+     Cpb=(0.5+0.5*tanh(k*(Cpb-DELTA)))*Cpb;
+    }
+    
+    if(m>2){
+     VOLT = voltvals[voltvals.n-3]*(((t-timevals[timevals.n-2])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-3]-timevals[timevals.n-2])*(timevals[timevals.n-3]-timevals[timevals.n-1]))) + voltvals[voltvals.n-2]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-1]))/((timevals[timevals.n-2]-timevals[timevals.n-3])*(timevals[timevals.n-2]-timevals[timevals.n-1]))) + voltvals[voltvals.n-1]*(((t-timevals[timevals.n-3])*(t-timevals[timevals.n-2]))/((timevals[timevals.n-1]-timevals[timevals.n-3])*(timevals[timevals.n-1]-timevals[timevals.n-2])));
+    }
+    
+
+
+    
+
+
+    I=Iapp(t)+0.1; //Note, the OR statement used below means that the while loop will only finish once BOTH conditions are satisfied
+    while ((abs(I-Iapp(t))>curTOL && K2==0) || (err1>errTOL && K2==0)){
+        i=i+1;
+        if(i>=newtTOL && m>0){   //If the number of Newton iterations exceeds specified number newtTOL, cancel current attempt and restart with smaller dt.
+            
+            if(dt==dtmin){
+                KcancelSim=1;
+                cout<<"ERROR A"<<endl;
+                break;
+            }
+
+            m-=1;  
+            dt=dt/stepsizeratio;
+            if(dt<dtmin){
+                dt=dtmin;
+            }
+            t=timevals[timevals.n-1];
+
+            K2=1;
+            Krestart=1;
+            mrestart=m;
+
+            mcount=MC;
+
+            restartNum=restartNum+1;
+
+            u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+            
+
+
+        }
+        if(KcancelSim==1) break;
+        if(K2==1) break;
+
+        check=0;
+        dHeat3check=0;
+
+        if(t<0) break;
+
+
+       
+        
+
+        if(m==0 || dt==dtmin){
+
+            check=1;
+
+            om = 1/dt;
+            Rpbo2 = -(1/dt)*CPBO2[Nstore-1];
+            Rpbo = -(1/dt)*CPBO[Nstore-1];
+            Rpb = -(1/dt)*CPB[Nstore-1];
+
+            
+
+            GAM1 = (1 + ((om^-1)/(2*F))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))^-1;
+            H1 = -(Rpbo/om) - CpbO - ((om^-1)/(2*F))*jpbO(u2,phi,VOLT,CbpbO2,CpbO);
+            SIG1 = ((om^-1)/(2*F))*(Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2));
+            dCbpbO2Lin = (1 - SIG1)^(-1)*(-(Rpbo2/om) - CbpbO2 + ((om^-1)/(2*F))*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbO(u2,phi,VOLT,CbpbO2,CpbO) + (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*H1));
+            dCpbOLin = GAM1*H1 - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*dCbpbO2Lin;
+            dCpbLin = (1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*(-(Rpb/om) - Cpb - ((om^-1)/(2*F))*jpb(u1,phi,Cpb));
+
+
+            try{
+                dHeat;  
+            }
+
+            catch(...){   //this will catch an error when calling dHeat should it occur 
+
+                if(dt==dtmin){
+                    KcancelSim=1;
+                    cout<<"ERROR B1"<<endl;
+                    break;
+                }
+
+                m-=1;  
+                dt=dt/stepsizeratio;
+                if(dt<dtmin){
+                    dt=dtmin;
+                }
+                t=timevals[timevals.n-1];
+
+                K2=1;
+                Krestart=1;
+                mrestart=m;
+
+                mcount=MC;
+
+                restartNum=restartNum+1;
+
+                
+
+                u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                
+
+            }
+
+            cout<<"BDF1"<<endl;
+
+        }
+
+        
+        if(m>=2 && dt/dtold<=2.01 && dt/dtold>=0.49 && dtold/dtold2<=2.01 && dtold/dtold2>=0.49 && check==0 && BDF3==1){ //dt/dtold == 1 && dtold/dtold2 ==1){// && (dt/dtold)<=2){// && (dt/dtold)<=2 && (dt/dtold)>=0.5 && (dtold/dtold2)<=2 && (dtold/dtold2)>=0.5){//(check==0)){
+
+
+            dHeat3check=1; 
+
+           
+
+
+            om = (1/dt)*(((1+2*(dt/dtold))/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))));//((1+(dt/dtold))/(1+2*(dt/dtold)));
+            
+            Rpbo2 = -om*CPBO2[Nstore-1] -(((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPBO2[Nstore-1] - CPBO2[Nstore-2])/dtold) + ((((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPBO2[Nstore-2] - CPBO2[Nstore-3])/dtold2) ;
+            Rpbo = -om*CPBO[Nstore-1] -(((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPBO[Nstore-1] - CPBO[Nstore-2])/dtold) + ((((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPBO[Nstore-2] - CPBO[Nstore-3])/dtold2) ;
+            Rpb = -om*CPB[Nstore-1] -(((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPB[Nstore-1] - CPB[Nstore-2])/dtold) + ((((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((CPB[Nstore-2] - CPB[Nstore-3])/dtold2) ;
+
+            GAM1 = (1 + ((om^-1)/(2*F))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))^-1;
+            H1 = -(Rpbo/om) - CpbO - ((om^-1)/(2*F))*jpbO(u2,phi,VOLT,CbpbO2,CpbO);
+            SIG1 = ((om^-1)/(2*F))*(Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2));
+            dCbpbO2Lin = (1 - SIG1)^(-1)*(-(Rpbo2/om) - CbpbO2 + ((om^-1)/(2*F))*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbO(u2,phi,VOLT,CbpbO2,CpbO) + (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*H1));
+            dCpbOLin = GAM1*H1 - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*dCbpbO2Lin;
+            dCpbLin = (1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*(-(Rpb/om) - Cpb - ((om^-1)/(2*F))*jpb(u1,phi,Cpb));
+
+            try{
+                dHeat3;
+            }
+
+            catch(...){   //this will catch an NAN error should it occur
+
+                if(dt==dtmin){
+                    KcancelSim=1;
+                    cout<<"ERROR B2"<<endl;
+                    break;
+                }
+
+                m-=1;  
+                dt=dt/stepsizeratio;
+                if(dt<dtmin){
+                        dt=dtmin;
+                }
+                t=timevals[timevals.n-1];
+
+                K2=1;
+                Krestart=1;
+                mrestart=m;
+
+                mcount=MC;
+
+                restartNum=restartNum+1;
+
+                
+                
+
+                u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                    
+
+            }
+
+            cout<<"BDF3"<<endl;
+
+        }
+
+
+
+        if(m>=1 && dHeat3check==0 && check==0){ 
+
+
+            om = (1/dt)*((1+2*(dt/dtold))/(1+(dt/dtold)));
+            Rpbo2 = -om*CPBO2[Nstore-1] - ((dt/dtold)/(1+(dt/dtold)))*((CPBO2[Nstore-1] - CPBO2[Nstore-2])/dtold);
+            Rpbo = -om*CPBO[Nstore-1] - ((dt/dtold)/(1+(dt/dtold)))*((CPBO[Nstore-1] - CPBO[Nstore-2])/dtold);
+            Rpb = -om*CPB[Nstore-1] - ((dt/dtold)/(1+(dt/dtold)))*((CPB[Nstore-1] - CPB[Nstore-2])/dtold);
+
+            GAM1 = (1 + ((om^-1)/(2*F))*DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))^-1;
+            H1 = -(Rpbo/om) - CpbO - ((om^-1)/(2*F))*jpbO(u2,phi,VOLT,CbpbO2,CpbO);
+            SIG1 = ((om^-1)/(2*F))*(Djpbo2Dcpbo2(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2));
+            dCbpbO2Lin = (1 - SIG1)^(-1)*(-(Rpbo2/om) - CbpbO2 + ((om^-1)/(2*F))*(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbO(u2,phi,VOLT,CbpbO2,CpbO) + (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*H1));
+            dCpbOLin = GAM1*H1 - GAM1*((om^-1)/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*dCbpbO2Lin;
+            dCpbLin = (1 + ((om^-1)/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*(-(Rpb/om)  - Cpb - ((om^-1)/(2*F))*jpb(u1,phi,Cpb));
+
+            try{
+                dHeat2;
+            }
+
+            catch(...){   //this will catch an NAN error should it occur
+
+                if(dt==dtmin){
+                    KcancelSim=1;
+                    cout<<"ERROR B3"<<endl;
+                    break;
+                }
+
+                m-=1;  
+                dt=dt/stepsizeratio;
+                if(dt<dtmin){
+                    dt=dtmin;
+                }
+                t=timevals[timevals.n-1];
+
+                K2=1;
+                Krestart=1;
+                mrestart=m;
+
+                mcount=MC;
+
+                restartNum=restartNum+1;
+
+                
+
+                u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                
+
+
+            }
+
+            cout<<"BDF2"<<endl;
+
+        }
+
+
+
+        if(KcancelSim==1) break;
+        if(K2==1) break;
+
+
+        
+
+        //Update solutions
+
+        dCpbO = dCpbOLin + (-GAM1*(dt/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - GAM1*(dt/(2*F))*DjpboDcpbo2(u2,phi,VOLT,CpbO,CbpbO2)*(1 - SIG1)^(-1)*(dt/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*(dt/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))));
+
+        dCbpbO2 = dCbpbO2Lin + ((1 - SIG1)^(-1)*(dt/(2*F))*(du1*jpbO2du1(phi,VOLT) + du2*(jpbO2du2(u2,phi,VOLT,CbpbO2,CpbO) + jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO)) + dphi*(jpbO2dphi(u1,phi,VOLT,CbpbO2,CpbO,u2) + jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO)) - (Djpbo2Dcpbo(CbpbO2,CpbO,u2,VOLT,phi) + DjpboDcpbo(u2,phi,VOLT,CpbO,CbpbO2))*GAM1*(dt/(2*F))*(du2*jpbOdu2(u2,phi,VOLT,CbpbO2,CpbO) + dphi*jpbOdphi(u2,phi,VOLT,CbpbO2,CpbO))));
+
+        dCpb = dCpbLin + (-(1 + (dt/(2*F))*DjpbDcpb(Cpb,phi))^(-1)*(dt/(2*F))*(du1*jpbdu1(phi) + dphi*jpbdphi(u1,phi,Cpb)));
+
+        CpbO[]+=dCpbO[];
+        CpbO=(0.5+0.5*tanh(k*(CpbO-DELTA)))*CpbO;
+
+        CbpbO2[]+=dCbpbO2[];
+        CbpbO2=(0.5+0.5*tanh(k*(CbpbO2-DELTA)))*CbpbO2;
+
+        Cpb[]+=dCpb[];
+        Cpb=(0.5+0.5*tanh(k*(Cpb-DELTA)))*Cpb;
+
+
+        u1[]+=du1[];    
+
+        u2[]+=du2[];
+
+        phi[]+=dphi[];
+
+
+
+        check=0;
+        dHeat3check=0;
+
+
+
+
+        //Solve for inlet concentrations
+
+        //BDF1
+        if(m==0){
+
+            check=1;
+
+            uin1 = (1 + ((dt*D)/Vr)*V*W)^(-1)*(UIN1[Nstore-1] + (dt*D/Vr)*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u1));
+
+            uin2 = (1 + ((dt*D)/Vr)*V*W)^(-1)*(UIN2[Nstore-1] + (dt*D/Vr)*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u2));
+        }
+
+
+        //BDF3
+        if(m>=2 && dt/dtold<=2.01 && dt/dtold>=0.49 && dtold/dtold2<=2.01 && dtold/dtold2>=0.49 && check==0 && BDF3==1){
+
+            dHeat3check=1;
+
+            om = ((1+2*(dt/dtold))/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2)));
+            
+            Rc1in = -(((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((UIN1[Nstore-1] - UIN1[Nstore-2])/dtold) + ((((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((UIN1[Nstore-2] - UIN1[Nstore-3])/dtold2) ;
+            uin1 = (1 + ((dt*D*V*W)/(om*Vr)))^(-1)*(UIN1[Nstore-1] -(dt*Rc1in/om) + (dt*D/(om*Vr))*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u1));
+
+            Rc2in = -(((dt/dtold)/(1+(dt/dtold))) + (((dt/dtold)*(dtold/dtold2))/(1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))) + (((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((UIN2[Nstore-1] - UIN2[Nstore-2])/dtold) + ((((dt/dtold)*((dtold/dtold2)^2)*(1+(dt/dtold)))/((1 + (dtold/dtold2) + (dt/dtold)*(dtold/dtold2))*(1+(dtold/dtold2)))))*((UIN2[Nstore-2] - UIN2[Nstore-3])/dtold2) ;
+            uin2 = (1 + ((dt*D*V*W)/(om*Vr)))^(-1)*(UIN2[Nstore-1] -(dt*Rc2in/om) + (dt*D/(om*Vr))*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u2));
+
+    
+        }
+
+
+        //BDF2
+        if(m>=1 && dHeat3check==0 && check==0){
+            om = ((1+2*(dt/dtold))/(1+(dt/dtold)));
+
+            Rc1in = (-((dt/dtold)/(1+(dt/dtold)))*((UIN1[Nstore-1] - UIN1[Nstore-2])/dtold)); 
+            uin1 = (1 + ((dt*D*V*W)/(om*Vr)))^(-1)*(UIN1[Nstore-1] -(dt*Rc1in/om) + (dt*D/(om*Vr))*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u1));
+
+            Rc2in = (-((dt/dtold)/(1+(dt/dtold)))*((UIN2[Nstore-1] - UIN2[Nstore-2])/dtold)); 
+            uin2 = (1 + ((dt*D*V*W)/(om*Vr)))^(-1)*(UIN2[Nstore-1] -(dt*Rc2in/om) + (dt*D/(om*Vr))*int1d(dom4,3)(((6*V/(W^2))*x*(W-x))*u2));
+        }//*/
+
+
+
+        check=0;
+        dHeat3check=0;
+
+
+        Iprev=I;
+        InegPrev=Ineg;
+
+        I = D*int1d(dom4, 4)(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2)+jpbO(u2,phi,VOLT,CbpbO2,CpbO));
+
+        Ineg = D*int1d(dom4, 2)(jpb(u1,phi,Cpb));
+
+
+
+       
+
+
+        if(i>3 && m>0){
+            if(abs(abs(I)-abs(Iapp(t)))>=abs(abs(Iprev)-abs(Iapp(t)))){
+
+                if(dt==dtmin){
+                    KcancelSim=1;
+                    cout<<"ERROR C1"<<endl;
+                    break;
+                }
+
+                m-=1;  
+                dt=dt/stepsizeratio;
+                if(dt<dtmin){
+                    dt=dtmin;
+                }
+                t=timevals[timevals.n-1];
+
+                K2=1;
+                Krestart=1;
+                mrestart=m;
+
+                mcount=MC;
+
+                restartNum=restartNum+1;
+
+                
+
+                u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                
+            }
+
+            if(abs(abs(Ineg)-abs(Iapp(t)))>=abs(abs(InegPrev)-abs(Iapp(t)))){
+
+                if(dt==dtmin){
+                    KcancelSim=1;
+                    cout<<"ERROR C2"<<endl;
+                    break;
+                }
+
+                m-=1;  
+                dt=dt/stepsizeratio;
+                if(dt<dtmin){
+                    dt=dtmin;
+                }
+                t=timevals[timevals.n-1];
+
+                K2=1;
+                Krestart=1;
+                mrestart=m;
+
+                mcount=MC;
+
+                restartNum=restartNum+1;
+
+                
+
+                u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                
+            }
+        }
+        if(KcancelSim==1) break;
+        if(K2==1) break;//*/
+
+        
+
+
+        cout<<"---"<<endl;
+        cout<<"Ipos="<<I<<endl;
+
+        cout<<"Ineg="<<Ineg<<endl;
+
+        cout<<"Iapp="<<Iapp(t)<<endl;
+        cout<<"---"<<endl;
+
+
+       
+
+        int Icounter=0;
+        while(abs(D*int1d(dom4, 4)(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2)+jpbO(u2,phi,VOLT,CbpbO2,CpbO))-Iapp(t))>1e-9){
+
+            VOLTprev2=VOLTprev;
+            VOLTprev=VOLT;
+            dVOLT=(Iapp(t) - D*int1d(dom4, 4)(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2)+jpbO(u2,phi,VOLT,CbpbO2,CpbO)))/(D*int1d(dom4, 4)(Djpbo2Dvolt(u1,phi,VOLT,CbpbO2,CpbO,u2) + DjpboDvolt(u2,phi,VOLT,CbpbO2,CpbO)));
+            VOLT = VOLT + dVOLT;
+            
+            if(Icounter>1 && m>0){
+                if(abs(abs(VOLT)-abs(VOLTprev))>=abs(abs(VOLTprev)-abs(VOLTprev2))){
+
+                    if(dt==dtmin){
+                        KcancelSim=1;
+                        cout<<"ERROR D"<<endl;
+                        break;
+                    }
+
+                    m-=1;  
+                    dt=dt/stepsizeratio;
+                    if(dt<dtmin){
+                        dt=dtmin;
+                    }
+                    t=timevals[timevals.n-1];
+
+                    K2=1;
+                    Krestart=1;
+                    mrestart=m;
+
+                    mcount=MC;
+
+                    restartNum=restartNum+1;
+
+                    
+
+                    u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+                    
+                }
+            }
+            if(KcancelSim==1) break;
+            if(K2==1) break;
+            Icounter=Icounter+1;
+            
+        }
+        if(KcancelSim==1) break;
+        if(K2==1) break;
+        
+        
+
+
+
+
+        cout<<"V="<<VOLT<<endl;
+
+        cout<<"dV="<<dVOLT<<endl;
+
+        cout<<"uin1="<<uin1<<endl;
+
+        cout<<"uin2="<<uin2<<endl;
+
+        cout<<"dt="<<dt<<endl;
+
+        cout<<"|dV/dt| = "<<abs((voltvals[voltvals.n-1]-VOLT)/dt)<<endl;
+
+        cout<<"dtmax="<<dtmax<<endl;
+
+        cout<<"t="<<t<<endl;
+
+        cout<<"dt/dtold="<<dt/dtold<<endl;
+
+        cout<<"dtold/dtold2="<<dtold/dtold2<<endl;
+
+        
+
+        itot=i;
+
+
+
+        real Lu1= u1[].linfty, Lu2=u2[].linfty, Lphi=phi[].linfty;
+        err1 = du1[].linfty/(Lu1) + du2[].linfty/(Lu2) + dphi[].linfty/(Lphi);
+
+        
+
+        if(isNaN(err1)==1){
+
+            if(dt==dtmin){
+                KcancelSim=1;
+                cout<<"ERROR E"<<endl;
+                break;
+            }
+
+            m-=1;  
+            dt=dt/stepsizeratio;
+            //dt=dtmin;
+            if(dt<dtmin){
+                dt=dtmin;
+            }
+            t=timevals[timevals.n-1];
+
+            K2=1;
+            Krestart=1;
+            mrestart=m;
+            mcount=MC;
+            restartNum=restartNum+1;
+            u1=U1[U1.n-1]; u2=U2[U2.n-1]; phi=PHI[PHI.n-1]; VOLT=voltvals[voltvals.n-1]; Cpb=CPB[Nstore-1]; CbpbO2=CPBO2[Nstore-1]; CpbO=CPBO[Nstore-1];
+            
+        }
+        if(KcancelSim==1) break;
+
+        if(K2==1) break;
+
+
+
+
+        
+        if(i==0){
+            errvals.resize(m+2);
+            errvals[m+1] = err1;
+
+        }
+        
+
+        cout<<i<<"err="<<err1<<endl;
+        
+
+
+
+        
+
+    }
+
+    
+    if(KcancelSim==1) break;
+    
+
+
+    if(m>2 && K2==0){
+
+        
+        
+        if(itot>1){
+            dvoltErr = abs((((VOLT - voltvals[voltvals.n-1])/(t - timevals[timevals.n-1])) - ((voltvals[voltvals.n-1] - voltvals[voltvals.n-2])/(timevals[timevals.n-1] - timevals[timevals.n-2])))/(1e-20 + ((voltvals[voltvals.n-1] - voltvals[voltvals.n-2])/(timevals[timevals.n-1] - timevals[timevals.n-2]))));
+            cout<<" - - - -"<<endl;
+            cout<<"dvoltErr="<<dvoltErr<<endl;
+
+            
+            
+            
+            if(dvoltErr>0.4 && dt>dtmin && itot>5){
+                //m-=1;  
+                DT=DT/stepsizeratio;
+                if(DT<dtmin){
+                    DT=dtmin;
+                }
+
+                mcount=MC;
+
+               
+            }
+            
+
+            if(dvoltErr<=0.3  && mcount==0){ 
+                DT=DT*stepsizeratio;  
+                if(DT>dtmax){  
+                    DT=dtmax;
+                }
+            }
+        }
+
+
+       
+        if(itot<=5){
+            DT=DT*2;
+            if(DT>dtmax){
+                DT=dtmax;
+            }
+        }
+    }
+
+   
+
+    if(K2==0){
+
+        dt=DT;
+
+        if(mcount>0){
+            mcount=mcount-1;
+        }
+
+        if(mRestart>0){
+            mRestart=mRestart-1;
+        }
+
+        
+
+
+        Vh4bound CpbWall2ver2 = Cpb; //interpolates Cpb calculated above onto wall2 only     
+        
+        real sumCpb=0;
+        for(int iii=0; iii<=(Vh4bound.ndof -1); iii++){
+            sumCpb+=CpbWall2ver2[][iii];
+        }
+        real CpbAv=(sumCpb)/(Vh4bound.ndof);
+        cout<<"----"<<endl;
+        cout<<"Average cumulative Pb concentration="<<CpbAv<<endl;
+        cout<<"----"<<endl;
+
+
+
+        
+
+        Vh4ver2bound CbpbO2Wall1ver2 = CbpbO2;
+        Vh4ver2bound CpbOWall1 = CpbO;
+
+
+        real sumbCpbO2=0;
+        for(int iii=0; iii<=(Vh4ver2bound.ndof -1); iii++){
+            sumbCpbO2+=CbpbO2Wall1ver2[][iii];
+        }
+        real CbpbO2Av=(sumbCpbO2)/(Vh4ver2bound.ndof);
+       cout<<"Average cumulative PbO2 concentration="<<CbpbO2Av<<endl;
+        
+        cout<<"----"<<endl;
+
+        
+        real sumCpbO=0;
+        for(int iii=0; iii<=(Vh4ver2bound.ndof -1); iii++){
+            sumCpbO+=CpbOWall1[][iii];
+        }
+        real CpbOAv=(sumCpbO)/(Vh4ver2bound.ndof);
+        cout<<"Average cumulative PbO concentration="<<CpbOAv<<endl;
+
+        cout<<"----"<<endl;
+        
+
+        Krestart=0;
+
+
+        itotvals.resize(m+2);
+        itotvals[m+1] = itot;
+
+   
+        
+
+
+        //To prevent overshoot of the specified end time
+        if(t+dtmax>ttotal){
+            while(t+dtmax>ttotal){
+                dtmax=dtmax*(1.5)^(-1);
+                if(dtmax<dtmin){
+                    dtmax=dtmin;
+                    break;
+                }
+            }
+        }
+
+
+
+        if(dt>dtmax){   //Make sure dt does not exceed dtmax after adjusting dtmax
+            dt=dtmax;
+        }
+        if(dt<dtmin){   
+            dt=dtmin*2;
+        }
+
+
+
+     
+        
+
+
+   
+
+
+
+        
+
+        cout<<" "<<endl;
+        cout<<" "<<endl;
+  
+        cout<<"---"<<endl;
+
+        cout<<"Total number of iterations needed for convergence = "<<itot<<endl;
+
+        cout<<" "<<endl;
+
+        
+
+        cout<<"CPU time = "<<clock()<<endl;
+
+        cout<<" "<<endl;
+
+        cout<<" "<<endl;
+
+        cout<<"---"<<endl;
+
+
+
+
+
+
+        //Store latest Nstore solutions
+        for (int G=0; G<=Nstore-1; G++){
+            if(G==Nstore-1){
+                U1[G]=u1; U2[G]=u2; PHI[G]=phi; CPB[G]=Cpb; CPBO2[G]=CbpbO2; CPBO[G]=CpbO; UIN1[G]=uin1; UIN2[G]=uin2;
+                break;
+            }
+            U1[G]=U1[G+1]; U2[G]=U2[G+1]; PHI[G]=PHI[G+1]; CPB[G]=CPB[G+1]; CPBO2[G]=CPBO2[G+1]; CPBO[G]=CPBO[G+1]; UIN1[G]=UIN1[G+1]; UIN2[G]=UIN2[G+1];
+        }
+
+
+
+
+
+        /*plot(phi, value=true, wait=false); //fill=true,
+
+
+
+        plot(u2, value=true, wait=true); //fill=true,
+
+        
+
+        plot(u1, value=true, wait=true); //fill=true,*/
+
+        
+       
+        
+
+
+
+
+        
+        dvoltErrvals.resize(m+2);
+        dvoltErrvals[m+1]=dvoltErr;
+        
+        
+        timevals.resize(m+2);
+        timevals[m+1] = t;
+
+        
+        voltvals.resize(m+2);
+        voltvals[m+1]=VOLT;
+
+        
+        CpbAvVals.resize(m+2);
+        CpbAvVals[m+1]=CpbAv;
+
+        
+        CbpbO2AvVals.resize(m+2);
+        CbpbO2AvVals[m+1]=CbpbO2Av;
+
+
+        CpbOAvVals.resize(m+2);
+        CpbOAvVals[m+1]=CpbOAv;
+
+
+        uin1AvVals.resize(m+2);
+        uin1AvVals[m+1]=uin1;//u1inAv;
+
+        uin2AvVals.resize(m+2);
+        uin2AvVals[m+1]=uin2;//u2inAv;
+
+
+        outintvals1.resize(m+2);
+        outintvals1[m+1]=int1d(dom4,3)((6*V/(W^2))*x*(W-x)*u1);
+
+
+        outintvals2.resize(m+2);
+        outintvals2[m+1]=int1d(dom4,3)((6*V/(W^2))*x*(W-x)*u2);
+
+
+        c1normvals.resize(m+2);
+        c1normvals[m+1]=int2d(dom4)(u1)/(W*L);//u1[].l2;
+
+
+        c2normvals.resize(m+2);
+        c2normvals[m+1]=int2d(dom4)(u2)/(W*L);//u2[].l2;
+
+
+        phinormvals.resize(m+2);
+        phinormvals[m+1]=int2d(dom4)(phi)/(W*L);//phi[].l2;//*/
+                
+
+
+        kappavalsA.resize(m+2);
+        kappavalsA[m+1]=(1/(L*W))*int2d(dom4)( (F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)) );
+
+        D10valsA.resize(m+2);
+        D10valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*u1/mu1); 
+
+        D20valsA.resize(m+2);
+        D20valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*u2/mu2); 
+
+        D30valsA.resize(m+2);
+        D30valsA[m+1]=(1/(L*W))*int2d(dom4)(R*T*(2*u1+u2)/mu3); 
+
+        t1vals.resize(m+2);
+        t1vals[m+1]=(1/(L*W))*int2d(dom4)( (z1^2*u1*F^2*mu1)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+        t2vals.resize(m+2);
+        t2vals[m+1]=(1/(L*W))*int2d(dom4)( (z2^2*u2*F^2*mu2)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+        t3vals.resize(m+2);
+        t3vals[m+1]=(1/(L*W))*int2d(dom4)( (z3^2*(2*u1+u2)*F^2*mu3)/(((F^2/(R*T))*(4*mu1*u1 + mu2*u2 + mu3*(2*u1+u2)))*R*T) ); 
+
+       
+
+
+        
+
+        VOLTfile.precision(12);
+        VOLTfile << voltvals[voltvals.n-1]  <<endl;
+        VOLTfile.flush;
+
+        
+        Timefile.precision(12);
+        Timefile << timevals[timevals.n-1] <<endl;
+        Timefile.flush;
+
+      
+        C1normfile.precision(12);
+        C1normfile << c1normvals[c1normvals.n-1]  <<endl;
+        C1normfile.flush;
+
+
+        C2normfile.precision(12);    
+        C2normfile << c2normvals[c2normvals.n-1] <<endl;
+        C2normfile.flush;
+
+
+        phinormfile.precision(12);
+        phinormfile << phinormvals[phinormvals.n-1]  <<endl;
+        phinormfile.flush;
+     
+
+        outint1file.precision(12);
+        outint1file << outintvals1[outintvals1.n-1]  <<endl;
+        outint1file.flush;
+
+   
+        dvoltErrfile.precision(12);
+        dvoltErrfile << dvoltErrvals[dvoltErrvals.n-1]  <<endl;
+        dvoltErrfile.flush;
+     
+
+        itotvalsfile.precision(12);
+        itotvalsfile << itotvals[itotvals.n-1]  <<endl;
+        itotvalsfile.flush;
+
+
+        err1file.precision(12);
+        err1file << errvals[errvals.n-1]  <<endl;
+        err1file.flush;
+
+
+        Cpbfile.precision(12);
+        Cpbfile << CpbAvVals[CpbAvVals.n-1]  <<endl;
+        Cpbfile.flush;
+
+
+        Cpbo2file.precision(12);
+        Cpbo2file << CbpbO2AvVals[CbpbO2AvVals.n-1]  <<endl;
+        Cpbo2file.flush;
+
+        
+        Cpbofile.precision(12);
+        Cpbofile << CpbOAvVals[CpbOAvVals.n-1]  <<endl;
+        Cpbofile.flush;
+
+
+        uin1file.precision(12);
+        uin1file << uin1AvVals[uin1AvVals.n-1]  <<endl;
+        uin1file.flush;
+
+
+        uin2file.precision(12);
+        uin2file << uin2AvVals[uin2AvVals.n-1]  <<endl;
+        uin2file.flush;
+
+
+        kappafile.precision(12);
+        kappafile << kappavalsA[kappavalsA.n-1]  <<endl;
+        kappafile.flush;
+
+
+        D10file.precision(12);
+        D10file << D10valsA[D10valsA.n-1]  <<endl;
+        D10file.flush;
+
+
+        D20file.precision(12);
+        D20file << D20valsA[D20valsA.n-1]  <<endl;
+        D20file.flush;
+
+
+        D30file.precision(12);
+        D30file << D30valsA[D30valsA.n-1]  <<endl;
+        D30file.flush;
+
+
+        t1file.precision(12);
+        t1file << t1vals[t1vals.n-1]  <<endl;
+        t1file.flush;
+
+
+        t2file.precision(12);
+        t2file << t2vals[t2vals.n-1]  <<endl;
+        t2file.flush;
+
+
+        t3file.precision(12);
+        t3file << t3vals[t3vals.n-1]  <<endl;
+        t3file.flush;
+
+
+        // int[int] orderOut=[1];
+        // if(m==100 || m==10 || m==50 || m==120 || m==90 ){
+        //     string ttt=t;
+        //     savevtk("phi_"+ttt+".vtu",dom4, phi, dataname="phi", order=orderOut);
+        //     savevtk("c1_"+ttt+".vtu",dom4, u1, dataname="c1", order=orderOut);
+        //     savevtk("c2_"+ttt+".vtu",dom4, u2, dataname="c2", order=orderOut);
+        // }
+    
+
+            
+
+        
+        // real[int] yplot = [0.005, 0.01, 0.03, 0.05, 0.07, 0.09, 0.1];
+
+        // int nplot = 200;
+
+        // ofstream fout("c_profiles.dat");
+
+        // for (int j = 0; j < yplot.n; j++)
+        // {
+        //     real yy = yplot[j];
+
+        //     for (int i = 0; i <= nplot; i++)
+        //     {
+        //         real xx = W*i/nplot;
+
+        //         fout << xx << " "
+        //             << yy << " "
+        //             << u1(xx,yy) << endl;
+        //     }
+
+        //     fout << endl;  // blank line between profiles
+        // }
+
+        // fout.flush;
+
+        
+
+
+
+
+        
+
+        real IBETApbo2=D*int1d(dom4, 4)(jpbO2(u1,phi,VOLT,CbpbO2,CpbO,u2));
+
+        real IpboBETA=D*int1d(dom4, 4)(jpbO(u2,phi,VOLT,CbpbO2,CpbO));
+
+        
+
+        cout<<"Current consumed by main +ve electrode reaction = "<<IBETApbo2<<endl;
+
+        cout<<" "<<endl;
+
+        cout<<"Current consumed by side +ve electrode reaction = "<<IpboBETA<<endl;
+
+        cout<<"---"<<endl;
+
+
+
+        
+        Vh4bound u1wall2=u1;
+
+        Vh4bound u2wall2=u2;
+
+
+
+        Vh4ver2bound u1wall1=u1;
+
+        Vh4ver2bound u2wall1=u2;
+
+
+
+
+        if(u1wall2[].max<=0 && Iapp(t)>0){
+
+            cout<<"Pb2+ conc. depleted along negative electrode"<<endl;
+
+            break;
+
+        }
+
+
+
+        if(u1wall1[].max<=0 && Iapp(t)>0){
+
+            cout<<"Pb2+ conc. depleted along positive electrode"<<endl;
+
+            break;
+
+        }
+
+
+
+        if(u2wall1[].max<=0 && Iapp(t)<0){
+
+            cout<<"H+ conc. depleted along positive electrode"<<endl;
+
+            break;
+
+        }
+
+
+
+        if(u2wall2[].max<=0 && Iapp(t)<0){
+
+            cout<<"H+ conc. depleted along negative electrode"<<endl;
+
+            break;
+
+        }
+
+    
+    }
+
+
+}
+
+
+if(KcancelSim==1){
+
+    cout<<"              ---                  "<<endl;
+    cout<<"Solver failed to converge within the specified tolerances. Here are some suggestions:"<<endl;
+    cout<<" "<<endl;
+    cout<<"1) Try lowering dtmin."<<endl;
+    cout<<" "<<endl;
+    cout<<"2) If m=0, check that the initial guesses for phi and VOLT are reasonable. It may require some trial and error."<<endl;
+    //cout<<"3) If convergence failure occurs when approaching surface concentration depletion of reactants along the electrodes, it is likely caused by the singul"
+    cout<<" "<<endl;
+    cout<<"3) Try loosening the tolerance on itot."<<endl;
+    cout<<" "<<endl;
+    cout<<"4) When reactants along the electrodes approach depletion, a singularity will begin to form in the solution which can cause the solver to fail, particularly if the timestep is too large."<<endl;
+    cout<<"In this case, the user could try: 1) Lowering dtmin, 2) Shorten the discharge period, 3) Adjust solver tolerances; stricter dt selection will enable better resolution of singularities during deep discharge"<<endl;
+    cout<<" "<<endl;
+    cout<<"5) A singularity in the solution will form when reacting ion concentrations begin to deplete next to the electrodes. This will occur if the cycle time is particularly long or if"<<endl;
+    cout<<"the applied current is very high."<<endl;
+    cout<<"              ---                  "<<endl;
+
+}
+
+
+if(KcancelSim==0){
+
+    cout<<"              ---                  "<<endl;
+    cout<<"--- Simulation reached the end --- "<<endl;
+    cout<<"              ---                  "<<endl;
+
+  
+
+
+
+}
+
+
+
+
+
